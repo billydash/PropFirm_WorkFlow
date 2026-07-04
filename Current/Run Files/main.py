@@ -1,14 +1,17 @@
-import os
-from dotenv import load_dotenv
+def load_keys():
+    """
+    Load API keys from environment variables.
+    Returns a tuple of (api_key, secret_key).
+    """
+    import os
+    from dotenv import load_dotenv
 
-# This tells Python to look for the .env file and load the variables
-load_dotenv()
+    # Load environment variables from .env file
+    load_dotenv()
 
-# Now you can access them using os.getenv
-api_key = os.getenv("public_key")
-secret_key = os.getenv("secret_key")
+    # Retrieve the keys
+    api_key = os.getenv("public_key")
+    secret_key = os.getenv("secret_key")
 
-if api_key and secret_key:
-    print("Keys loaded successfully!")
-else:
-    print("One or both keys not found.")
+    return api_key, secret_key
+print(load_keys())
