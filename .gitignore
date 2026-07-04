@@ -220,3 +220,7 @@ __marimo__/
 # ORB backtester output
 Current/Backtesters/orb_trades.csv
 Current/Backtesters/orb_equity.png
+
+# Monte Carlo simulator output
+Current/Challenge Phase/mc_results.csv
+Current/Challenge Phase/mc_dashboard.png

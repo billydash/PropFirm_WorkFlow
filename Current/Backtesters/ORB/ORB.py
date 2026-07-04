@@ -51,8 +51,13 @@ class ORBConfig:
     reentry_enabled: bool = False
     max_reentries_per_direction: int = 0
 
+    # ROUGH PLACEHOLDER for eventual FTMO execution: this strategy would likely run as
+    # FTMO's S&P 500 index CFD (confirmed zero-commission), not real SPY shares, so
+    # commission stays $0 but slippage is widened vs. a real-shares assumption to
+    # approximate a CFD spread (~0.4-0.5 index points ~= $0.03-0.05/SPY-equivalent
+    # share). Revisit both once FTMO's actual live spread/commission is confirmed.
     commission_per_fill: float = 0.0
-    slippage_per_share: float = 0.0
+    slippage_per_share: float = 0.03
 
     starting_equity: float = 100_000.0
 
@@ -440,8 +445,8 @@ def plot_equity_curve(equity: pd.Series, output_path: str) -> None:
 
 if __name__ == "__main__":
     config = ORBConfig(
-        start_date="2026-01-01",  # "YYYY-MM-DD", first date included in the backtest
-        end_date="2026-07-02",  # "YYYY-MM-DD", last date included in the backtest
+        start_date="2022-01-01",  # "YYYY-MM-DD", first date included in the backtest
+        end_date="2022-12-31",  # "YYYY-MM-DD", last date included in the backtest
 
         # Which breakout direction(s) to trade:
         #   "long"  - only take OR-high breakouts
@@ -465,13 +470,17 @@ if __name__ == "__main__":
         stop_mode="opposite_or",
 
         rr=2.0,  # reward:risk multiple — target = entry +/- (stop_distance * rr)
-        risk_per_trade_usd=200.0,  # fixed $ risked per trade; shares = floor(risk_per_trade_usd / stop_distance)
+        risk_per_trade_usd=100.0,  # fixed $ risked per trade; shares = floor(risk_per_trade_usd / stop_distance)
 
         # Whether a direction (long/short) can re-trigger after being stopped out
         # (never after a target hit) later the same day.
         reentry_enabled=True,
         # Max re-entries allowed per direction per day; only used when reentry_enabled is True.
         max_reentries_per_direction=1,
+
+        or_duration_minutes=30,  # opening-range window length in minutes
+
+        last_entry_time=time(11, 00),  # last time a NEW breakout entry may be triggered
 
         # Other available options (all keep their ORBConfig defaults unless set here):
         #   csv_path                - path to the 1-min OHLCV CSV to backtest
