@@ -46,7 +46,7 @@ class ORBConfig:
 
     csv_path: str = field(
         default_factory=lambda: os.path.join(
-            os.path.dirname(__file__), "..", "data", "SPY_1min.csv"
+            os.path.dirname(__file__), "..", "..", "data", "SPY_1min.csv"
         )
     )
     timezone: str = "America/New_York"
