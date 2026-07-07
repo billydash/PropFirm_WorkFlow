@@ -1,11 +1,19 @@
 """Monte Carlo simulator for the FTMO 50k 2-step Challenge (Challenge + Verification),
-bootstrapped from the ORB backtester's trade log (Current/Backtesters/orb_trades.csv).
+bootstrapped from the ORB backtester's trade log (Current/Backtesters/ORB/orb_trades.csv).
 
-Rules modeled (ftmo.com/en/trading-objectives, 2026):
+Rules modeled (ftmo.com/en/trading-objectives, confirmed live 2026-07-07):
   - Challenge (phase 1): 10% profit target
   - Verification (phase 2): 5% profit target, on a FRESH account reset to account_size
-  - Maximum Daily Loss: 5% of the day's starting equity, recalculated each day
-  - Maximum Overall Loss: 10% of initial capital, STATIC (never moves)
+  - Maximum Daily Loss: a FIXED dollar amount (5% of Initial Capital) subtracted from
+    the PREVIOUS day's closing equity, recalculated daily. This offset is a static
+    dollar figure -- it does NOT scale with the current day's equity. This mechanic
+    is identical across Challenge, Verification, AND the funded Account (see
+    ../Funded Phase/monte_carlo.py, which implements the same rule) -- FTMO does not
+    vary the daily-loss mechanic by phase, only the percentage differs by program
+    (3% for 1-Step, 5% for 2-Step).
+  - Maximum Overall Loss: 10% of initial capital, STATIC (never moves). This is the
+    2-Step program's overall-loss mechanic; the 1-Step program instead trails the
+    highest EOD balance ever achieved (not modeled here).
   - Minimum 4 distinct trading days per phase before it can be marked passed
   - Both loss limits are checked continuously against equity, so a trade's MAE
     (worst intra-trade dip) can breach a limit even if the trade closes as a win.
@@ -14,6 +22,12 @@ Assumption: each historical trade's r_multiple and mae_r are unitless ratios
 (relative to the ORB backtest's own risk_per_trade_usd), so rescaling them by
 a different risk_amount here correctly reproduces the same relative edge,
 independent of the original $/share mechanics.
+
+Trading calendar: day_groups/day_trade_counts are built from
+Backtesters/ORB/orb_trading_days.csv (the full set of real trading days the ORB
+backtest ran over) when that file is present alongside trades_csv_path, so days
+that produced zero trades are correctly represented as idle days during resampling
+instead of being silently absent from the trade pool.
 """
 
 import math
@@ -32,7 +46,7 @@ Outcome = Literal["passed", "daily_loss", "overall_loss", "timeout"]
 
 @dataclass
 class MonteCarloConfig:
-    # Path to trade CSV from ORB backtester. Default points to ../Backtesters/orb_trades.csv
+    # Path to trade CSV from ORB backtester. Default points to ../Backtesters/ORB/orb_trades.csv
     trades_csv_path: str = field(
         default_factory=lambda: os.path.join(
             os.path.dirname(__file__), "..", "Backtesters/ORB", "orb_trades.csv"
@@ -49,7 +63,12 @@ class MonteCarloConfig:
     # Phase 2 (Verification) profit target as percentage; resets on fresh account
     profit_target_phase2_pct: float = 5.0
 
-    # Maximum daily loss allowed, calculated fresh each trading day (% of day-start equity)
+    # Maximum Daily Loss, as % of starting_capital (account_size for this phase).
+    # Converted internally to a FIXED dollar offset (starting_capital * pct/100)
+    # subtracted from the PREVIOUS day's closing equity -- this offset never scales
+    # with current equity, only the anchor (previous close) moves day to day. This
+    # matches FTMO's real rule (confirmed live from ftmo.com) and is the same
+    # mechanic ../Funded Phase/monte_carlo.py already implements.
     # If a trade's MAE breaches this, phase fails immediately
     daily_loss_limit_pct: float = 5.0
 
@@ -62,15 +81,20 @@ class MonteCarloConfig:
     min_trading_days_per_phase: int = 4
 
     # === Trade Resampling Mode ===
-    # "bootstrap_trades": shuffle individual trades, draw trades_per_day per simulated day
+    # "bootstrap_trades": shuffle individual trades, drawing a per-day trade count
+    #     from the empirical historical distribution each simulated day (see trades_per_day)
     # "bootstrap_days": shuffle entire historical trading days (preserves correlation within days)
     # "bootstrap_blocks": draw contiguous RUNS of historical days (see block settings below).
     #     This is the least optimistic mode: it preserves losing/winning streaks and
     #     volatility clustering ACROSS days, which the two i.i.d. modes destroy.
     resample_mode: ResampleMode = "bootstrap_trades"
 
-    # Number of trades to draw per simulated trading day (only used for "bootstrap_trades" mode)
-    # Typical values: 1-5 trades per day depending on strategy
+    # FALLBACK ONLY for "bootstrap_trades" mode: fixed number of trades to draw per
+    # simulated day, used only if orb_trading_days.csv (the trading-day calendar)
+    # isn't found alongside trades_csv_path. When the calendar IS found (the normal
+    # case), the per-day trade count is instead drawn from the empirical historical
+    # distribution (including zero-trade days), which is more accurate than any
+    # single fixed constant -- see load_trade_pool / DaySampler.
     trades_per_day: int = 2
 
     # === Block Resampling (only used when resample_mode == "bootstrap_blocks") ===
@@ -165,40 +189,75 @@ def _max_drawdown_pct(equity_curve: list, starting_capital: float) -> float:
 
 
 def load_trade_pool(config: MonteCarloConfig):
+    """Returns (flat_trades, day_groups, day_trade_counts, trade_pool_df).
+
+    day_groups/day_trade_counts are built over the FULL historical trading
+    calendar (orb_trading_days.csv, written by the ORB backtester alongside
+    trades_csv_path), not just the days that happen to appear in trades_csv_path.
+    Days with zero fired trades have no row in the trades CSV at all, so without
+    the calendar they'd be silently invisible to every resample mode -- both
+    "bootstrap_days"/"bootstrap_blocks" (which sample day_groups directly) and
+    "bootstrap_trades" (which uses day_trade_counts to draw a realistic per-day
+    trade count, including zero, instead of a fixed constant).
+    """
     df = pd.read_csv(config.trades_csv_path, parse_dates=["date"])
     df = df.sort_values(["date", "entry_time"]).reset_index(drop=True)
 
     flat_trades = df[["r_multiple", "mae_r"]].to_numpy()
 
-    day_groups = [
-        day_df[["r_multiple", "mae_r"]].to_numpy() for _, day_df in df.groupby("date")
-    ]
+    trades_by_date = {
+        date: day_df[["r_multiple", "mae_r"]].to_numpy()
+        for date, day_df in df.groupby("date")
+    }
 
-    return flat_trades, day_groups, df
+    calendar_path = os.path.join(os.path.dirname(config.trades_csv_path), "orb_trading_days.csv")
+    if os.path.exists(calendar_path):
+        calendar_dates = pd.read_csv(calendar_path, parse_dates=["date"])["date"]
+        day_groups = [trades_by_date.get(d, np.empty((0, 2))) for d in calendar_dates]
+    else:
+        print(
+            f"WARNING: trading-day calendar not found at {calendar_path} -- falling back "
+            "to a trades-only calendar (days with zero fired trades are silently excluded "
+            "from resampling, which overstates trading frequency). Re-run ORB.py to "
+            "regenerate orb_trading_days.csv."
+        )
+        day_groups = list(trades_by_date.values())
+
+    day_trade_counts = np.array([len(day) for day in day_groups])
+
+    return flat_trades, day_groups, day_trade_counts, df
 
 
 class DaySampler:
     """Yields one simulated trading day of (r_multiple, mae_r) trades at a time.
 
-    - bootstrap_trades: draw `trades_per_day` individual trades i.i.d.
-    - bootstrap_days:   draw one whole historical day i.i.d.
+    - bootstrap_trades: draw a per-day trade COUNT from the empirical historical
+      distribution in day_trade_counts (including zero-trade days), then draw that
+      many individual trades i.i.d. Falls back to the fixed `trades_per_day`
+      constant only if day_trade_counts wasn't built from a real calendar (see
+      load_trade_pool).
+    - bootstrap_days:   draw one whole historical day i.i.d. (may be empty).
     - bootstrap_blocks: draw contiguous RUNS of historical days (circular block
       bootstrap), handing them back one day at a time so cross-day streaks are
       preserved. The remaining days of the current block are held as instance
       state, so a FRESH sampler must be created per phase (done in simulate_phase).
     """
 
-    def __init__(self, config: MonteCarloConfig, flat_trades, day_groups, rng):
+    def __init__(self, config: MonteCarloConfig, flat_trades, day_groups, day_trade_counts, rng):
         self.config = config
         self.flat_trades = flat_trades
         self.day_groups = day_groups
+        self.day_trade_counts = day_trade_counts
         self.rng = rng
         self._block_buffer: list = []
 
     def next_day(self):
         mode = self.config.resample_mode
         if mode == "bootstrap_trades":
-            idx = self.rng.integers(0, len(self.flat_trades), size=self.config.trades_per_day)
+            n = int(self.rng.choice(self.day_trade_counts))
+            if n == 0:
+                return self.flat_trades[:0]
+            idx = self.rng.integers(0, len(self.flat_trades), size=n)
             return self.flat_trades[idx]
         if mode == "bootstrap_days":
             idx = self.rng.integers(0, len(self.day_groups))
@@ -228,11 +287,18 @@ def simulate_phase(
     profit_target_pct: float,
     flat_trades,
     day_groups,
+    day_trade_counts,
     rng,
 ) -> PhaseResult:
     equity = starting_capital
     overall_floor = starting_capital * (1 - config.max_overall_loss_pct / 100)
     target_equity = starting_capital * (1 + profit_target_pct / 100)
+    # Fixed $ offset, computed once from starting_capital (FTMO's real rule: a
+    # static dollar amount off the PREVIOUS day's closing equity, not a % of
+    # current equity). Matches ../Funded Phase/monte_carlo.py's mechanic. Since
+    # Verification resets to a fresh starting_capital, this offset is correctly
+    # recomputed per-phase rather than carried over from phase 1.
+    daily_loss_offset = starting_capital * config.daily_loss_limit_pct / 100
 
     distinct_trading_days = 0
     trades_taken = 0
@@ -240,11 +306,14 @@ def simulate_phase(
 
     # Fresh sampler per phase so any in-progress block does not leak across the
     # phase 1 -> phase 2 account reset.
-    sampler = DaySampler(config, flat_trades, day_groups, rng)
+    sampler = DaySampler(config, flat_trades, day_groups, day_trade_counts, rng)
 
     for day in range(1, config.max_trading_days_per_phase + 1):
         day_start_equity = equity
-        daily_floor = day_start_equity * (1 - config.daily_loss_limit_pct / 100)
+        # day_start_equity is already the previous day's closing equity (day 1
+        # anchors to starting_capital), so subtracting the fixed offset here
+        # reproduces FTMO's real "previous close minus fixed $" daily floor.
+        daily_floor = day_start_equity - daily_loss_offset
 
         day_trades = sampler.next_day()
         if len(day_trades) > 0:
@@ -289,9 +358,10 @@ def simulate_phase(
     )
 
 
-def simulate_trial(config: MonteCarloConfig, flat_trades, day_groups, rng) -> TrialResult:
+def simulate_trial(config: MonteCarloConfig, flat_trades, day_groups, day_trade_counts, rng) -> TrialResult:
     phase1 = simulate_phase(
-        config, config.account_size, config.profit_target_phase1_pct, flat_trades, day_groups, rng
+        config, config.account_size, config.profit_target_phase1_pct,
+        flat_trades, day_groups, day_trade_counts, rng
     )
 
     if phase1.outcome != "passed":
@@ -308,7 +378,8 @@ def simulate_trial(config: MonteCarloConfig, flat_trades, day_groups, rng) -> Tr
         )
 
     phase2 = simulate_phase(
-        config, config.account_size, config.profit_target_phase2_pct, flat_trades, day_groups, rng
+        config, config.account_size, config.profit_target_phase2_pct,
+        flat_trades, day_groups, day_trade_counts, rng
     )
 
     overall_pass = phase2.outcome == "passed"
@@ -326,13 +397,13 @@ def simulate_trial(config: MonteCarloConfig, flat_trades, day_groups, rng) -> Tr
 
 
 def run_monte_carlo(config: MonteCarloConfig):
-    flat_trades, day_groups, trade_pool_df = load_trade_pool(config)
+    flat_trades, day_groups, day_trade_counts, trade_pool_df = load_trade_pool(config)
     rng = np.random.default_rng(config.random_seed)
 
     rows = []
     sample_curves = []
     for i in range(config.num_simulations):
-        trial = simulate_trial(config, flat_trades, day_groups, rng)
+        trial = simulate_trial(config, flat_trades, day_groups, day_trade_counts, rng)
         rows.append(
             {
                 "phase1_outcome": trial.phase1_outcome,
@@ -527,13 +598,13 @@ def format_config_report(config: MonteCarloConfig) -> str:
         f"{'Account size':28}${config.account_size:,.2f}",
         f"{'Phase 1 target':28}{config.profit_target_phase1_pct}%",
         f"{'Phase 2 target':28}{config.profit_target_phase2_pct}%",
-        f"{'Daily loss limit':28}{config.daily_loss_limit_pct}% (of day-start equity)",
+        f"{'Daily loss limit':28}{config.daily_loss_limit_pct}% of IC (static $, off prev close)",
         f"{'Max overall loss':28}{config.max_overall_loss_pct}% (static, of initial capital)",
         f"{'Min trading days/phase':28}{config.min_trading_days_per_phase}",
         f"{'Resample mode':28}{config.resample_mode}",
     ]
     if config.resample_mode == "bootstrap_trades":
-        lines.append(f"{'Trades per day':28}{config.trades_per_day}")
+        lines.append(f"{'Trades per day':28}empirical (calendar) / {config.trades_per_day} fallback")
     if config.resample_mode == "bootstrap_blocks":
         if config.block_size_range is not None:
             block_line = f"{config.block_size_range[0]}-{config.block_size_range[1]} days (random per block)"

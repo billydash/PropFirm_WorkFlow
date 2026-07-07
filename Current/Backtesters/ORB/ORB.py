@@ -163,10 +163,17 @@ def find_next_breakout(
 
     for idx, bar in candidates.iterrows():
         if config.entry_mode == "stop":
+            # Resting-stop fill: normally fills exactly at the OR level, but if the
+            # bar's OPEN already gapped through the level (price moved past it before
+            # this bar even started), a real resting order fills at that worse open
+            # price instead -- the level was never available to trade at. Empirically
+            # ~23% of breakout bars in this data gap through (mean overshoot $0.07/share).
             if "long" in directions_allowed and bar["high"] >= or_high:
-                return "long", bar["timestamp"], or_high, idx
+                fill_price = max(bar["open"], or_high)
+                return "long", bar["timestamp"], fill_price, idx
             if "short" in directions_allowed and bar["low"] <= or_low:
-                return "short", bar["timestamp"], or_low, idx
+                fill_price = min(bar["open"], or_low)
+                return "short", bar["timestamp"], fill_price, idx
         else:  # close
             if "long" in directions_allowed and bar["close"] >= or_high:
                 next_bar = day_df[day_df.index > idx].head(1)
@@ -308,16 +315,25 @@ def run_day(day_df: pd.DataFrame, config: ORBConfig) -> list:
     return trades
 
 
-def run_backtest(config: ORBConfig) -> pd.DataFrame:
+def run_backtest(config: ORBConfig) -> tuple:
+    """Returns (trades_df, trading_days_df). trading_days_df has one row per REAL
+    trading day found in the price data within [start_date, end_date], regardless
+    of whether that day produced any trades -- this is the authoritative trading
+    calendar the Monte Carlo simulators bootstrap from, so days with zero fired
+    trades aren't silently invisible to resampling (see orb_trading_days.csv)."""
     df = load_data(config)
     all_trades = []
-    for _, day_df in iter_sessions(df):
+    trading_days = []
+    for trading_date, day_df in iter_sessions(df):
+        trading_days.append(trading_date)
         all_trades.extend(run_day(day_df, config))
 
-    if not all_trades:
-        return pd.DataFrame()
+    trading_days_df = pd.DataFrame({"date": trading_days})
 
-    return pd.DataFrame([vars(t) for t in all_trades])
+    if not all_trades:
+        return pd.DataFrame(), trading_days_df
+
+    return pd.DataFrame([vars(t) for t in all_trades]), trading_days_df
 
 
 def compute_stats(trades_df: pd.DataFrame, config: ORBConfig) -> dict:
@@ -513,10 +529,15 @@ if __name__ == "__main__":
         #   starting_equity         - starting balance, used only for the equity curve/drawdown %
     )
 
-    trades_df = run_backtest(config)
+    trades_df, trading_days_df = run_backtest(config)
 
     out_dir = os.path.dirname(__file__)
     print(format_config_report(config))
+
+    trading_days_csv = os.path.join(out_dir, "orb_trading_days.csv")
+    trading_days_df.to_csv(trading_days_csv, index=False)
+    print(f"Saved trading-day calendar ({len(trading_days_df)} days) to {trading_days_csv}")
+
     if trades_df.empty:
         print("\nNo trades generated for the given config/date range.")
     else:
