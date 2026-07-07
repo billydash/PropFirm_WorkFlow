@@ -18,14 +18,14 @@ independent of the original $/share mechanics.
 
 import math
 import os
-from dataclasses import dataclass, field
-from typing import Literal, Optional
+from dataclasses import dataclass, field, replace
+from typing import Literal, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-ResampleMode = Literal["bootstrap_trades", "bootstrap_days"]
+ResampleMode = Literal["bootstrap_trades", "bootstrap_days", "bootstrap_blocks"]
 PositionSizingMode = Literal["pct_current_equity", "pct_initial_capital", "fixed_usd"]
 Outcome = Literal["passed", "daily_loss", "overall_loss", "timeout"]
 
@@ -35,7 +35,7 @@ class MonteCarloConfig:
     # Path to trade CSV from ORB backtester. Default points to ../Backtesters/orb_trades.csv
     trades_csv_path: str = field(
         default_factory=lambda: os.path.join(
-            os.path.dirname(__file__), "..", "Backtesters", "orb_trades.csv"
+            os.path.dirname(__file__), "..", "Backtesters/ORB", "orb_trades.csv"
         )
     )
 
@@ -64,11 +64,29 @@ class MonteCarloConfig:
     # === Trade Resampling Mode ===
     # "bootstrap_trades": shuffle individual trades, draw trades_per_day per simulated day
     # "bootstrap_days": shuffle entire historical trading days (preserves correlation within days)
+    # "bootstrap_blocks": draw contiguous RUNS of historical days (see block settings below).
+    #     This is the least optimistic mode: it preserves losing/winning streaks and
+    #     volatility clustering ACROSS days, which the two i.i.d. modes destroy.
     resample_mode: ResampleMode = "bootstrap_trades"
 
     # Number of trades to draw per simulated trading day (only used for "bootstrap_trades" mode)
     # Typical values: 1-5 trades per day depending on strategy
     trades_per_day: int = 2
+
+    # === Block Resampling (only used when resample_mode == "bootstrap_blocks") ===
+    # Circular block bootstrap: each block starts at a random historical day and takes
+    # `block_size_days` consecutive days, wrapping past the end of the history back to the
+    # start so every day is equally likely and blocks keep their full length. Preserving
+    # runs of consecutive real days keeps cross-day streaks intact and gives more realistic
+    # (higher) failure rates than shuffling days independently.
+    #
+    # Fixed block length in trading days. Used when block_size_range is None.
+    block_size_days: int = 5
+    #
+    # Optional (min, max) INCLUSIVE range of block lengths in trading days. If set, each
+    # block's length is drawn uniformly from [min, max] (so blocks vary in size); this
+    # overrides block_size_days. Set to None to use the fixed block_size_days instead.
+    block_size_range: Optional[Tuple[int, int]] = None
 
     # === Position Sizing ===
     # Method for determining risk per trade:
@@ -100,6 +118,20 @@ class MonteCarloConfig:
     # Number of equity curves to save for visualization (plots first N trial curves)
     # Higher = more curves in the dashboard plot, but larger output. Typical: 50-200
     sample_curves_to_keep: int = 50
+
+    # === Risk-per-trade Sweep (pass-rate curve) ===
+    # When enabled, after the main run the simulator re-runs the Monte Carlo across a range
+    # of risk_pct values and plots overall pass rate (with 95% CI) vs risk. Pass rate is
+    # extremely sensitive to position size, so a single headline number is misleading
+    # without the sizing it assumes. Only meaningful for the pct_* sizing modes.
+    run_risk_sweep_enabled: bool = True
+
+    # Risk-per-trade values (% of equity/capital) to evaluate in the sweep.
+    risk_sweep_values: Tuple[float, ...] = (0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0)
+
+    # Simulations per risk level in the sweep. Lower than num_simulations to keep the
+    # multi-point sweep fast; raise for tighter confidence bands on the curve.
+    risk_sweep_simulations: int = 3_000
 
 
 @dataclass
@@ -145,13 +177,49 @@ def load_trade_pool(config: MonteCarloConfig):
     return flat_trades, day_groups, df
 
 
-def draw_day_trades(config: MonteCarloConfig, flat_trades, day_groups, rng):
-    if config.resample_mode == "bootstrap_trades":
-        idx = rng.integers(0, len(flat_trades), size=config.trades_per_day)
-        return flat_trades[idx]
-    else:  # bootstrap_days
-        idx = rng.integers(0, len(day_groups))
-        return day_groups[idx]
+class DaySampler:
+    """Yields one simulated trading day of (r_multiple, mae_r) trades at a time.
+
+    - bootstrap_trades: draw `trades_per_day` individual trades i.i.d.
+    - bootstrap_days:   draw one whole historical day i.i.d.
+    - bootstrap_blocks: draw contiguous RUNS of historical days (circular block
+      bootstrap), handing them back one day at a time so cross-day streaks are
+      preserved. The remaining days of the current block are held as instance
+      state, so a FRESH sampler must be created per phase (done in simulate_phase).
+    """
+
+    def __init__(self, config: MonteCarloConfig, flat_trades, day_groups, rng):
+        self.config = config
+        self.flat_trades = flat_trades
+        self.day_groups = day_groups
+        self.rng = rng
+        self._block_buffer: list = []
+
+    def next_day(self):
+        mode = self.config.resample_mode
+        if mode == "bootstrap_trades":
+            idx = self.rng.integers(0, len(self.flat_trades), size=self.config.trades_per_day)
+            return self.flat_trades[idx]
+        if mode == "bootstrap_days":
+            idx = self.rng.integers(0, len(self.day_groups))
+            return self.day_groups[idx]
+        # bootstrap_blocks: refill the buffer with a fresh random block when empty
+        if not self._block_buffer:
+            self._block_buffer = self._draw_block()
+        return self._block_buffer.pop(0)
+
+    def _draw_block(self) -> list:
+        n = len(self.day_groups)
+        if self.config.block_size_range is not None:
+            lo, hi = self.config.block_size_range
+            length = int(self.rng.integers(lo, hi + 1))
+        else:
+            length = self.config.block_size_days
+        length = max(1, length)
+        start = int(self.rng.integers(0, n))
+        # Circular block: wrap past the end back to the start so every start
+        # index is valid and every historical day is equally likely to appear.
+        return [self.day_groups[(start + i) % n] for i in range(length)]
 
 
 def simulate_phase(
@@ -170,11 +238,15 @@ def simulate_phase(
     trades_taken = 0
     equity_curve = [equity]
 
+    # Fresh sampler per phase so any in-progress block does not leak across the
+    # phase 1 -> phase 2 account reset.
+    sampler = DaySampler(config, flat_trades, day_groups, rng)
+
     for day in range(1, config.max_trading_days_per_phase + 1):
         day_start_equity = equity
         daily_floor = day_start_equity * (1 - config.daily_loss_limit_pct / 100)
 
-        day_trades = draw_day_trades(config, flat_trades, day_groups, rng)
+        day_trades = sampler.next_day()
         if len(day_trades) > 0:
             distinct_trading_days += 1
 
@@ -345,6 +417,101 @@ def compute_input_data_stats(trade_pool_df: pd.DataFrame) -> dict:
     }
 
 
+def run_risk_sweep(base_config: MonteCarloConfig, risk_values=None) -> pd.DataFrame:
+    """Re-run the Monte Carlo across a range of risk_pct values and collect the
+    overall pass rate (with CI) and failure breakdown at each level.
+
+    Uses the same random_seed for every point (common random numbers), so the
+    curve reflects the effect of risk sizing rather than sampling noise between
+    points. Runs risk_sweep_simulations trials per point to keep it fast.
+    """
+    risk_values = risk_values if risk_values is not None else base_config.risk_sweep_values
+    rows = []
+    for rp in risk_values:
+        cfg = replace(
+            base_config,
+            risk_pct=rp,
+            num_simulations=base_config.risk_sweep_simulations,
+        )
+        results_df, _, _ = run_monte_carlo(cfg)
+        s = compute_summary_stats(results_df, cfg)
+        rows.append(
+            {
+                "risk_pct": rp,
+                "overall_pass_pct": s["overall_pass_pct"],
+                "ci_low": s["overall_pass_ci_low"],
+                "ci_high": s["overall_pass_ci_high"],
+                "phase1_pass_pct": s["phase1_pass_pct"],
+                "fail_daily_loss_pct": s["fail_daily_loss_pct"],
+                "fail_overall_loss_pct": s["fail_overall_loss_pct"],
+                "fail_timeout_pct": s["fail_timeout_pct"],
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def format_risk_sweep_report(sweep_df: pd.DataFrame) -> str:
+    width = 60
+    lines = [
+        "RISK-PER-TRADE SWEEP".center(width),
+        "=" * width,
+        f"{'Risk %':>7}{'Pass %':>9}{'95% CI':>17}{'Daily':>8}{'Overall':>9}{'T-out':>7}",
+        "-" * width,
+    ]
+    for _, r in sweep_df.iterrows():
+        ci = f"[{r['ci_low']:.1f}, {r['ci_high']:.1f}]"
+        lines.append(
+            f"{r['risk_pct']:>7.2f}{r['overall_pass_pct']:>9.2f}{ci:>17}"
+            f"{r['fail_daily_loss_pct']:>8.1f}{r['fail_overall_loss_pct']:>9.1f}{r['fail_timeout_pct']:>7.1f}"
+        )
+    best = sweep_df.loc[sweep_df["overall_pass_pct"].idxmax()]
+    lines += [
+        "-" * width,
+        f"Peak pass rate {best['overall_pass_pct']:.2f}% at risk {best['risk_pct']:.2f}%",
+        "=" * width,
+    ]
+    return "\n".join(lines)
+
+
+def plot_risk_curve(sweep_df: pd.DataFrame, config: MonteCarloConfig, output_path: str) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+    rp = sweep_df["risk_pct"]
+
+    # Left: overall pass rate vs risk, with 95% Wilson CI band
+    ax = axes[0]
+    ax.plot(rp, sweep_df["overall_pass_pct"], marker="o", color="#2a78d6", linewidth=1.8, label="Overall pass rate")
+    ax.fill_between(rp, sweep_df["ci_low"], sweep_df["ci_high"], color="#2a78d6", alpha=0.18, label="95% CI")
+    best = sweep_df.loc[sweep_df["overall_pass_pct"].idxmax()]
+    ax.axvline(best["risk_pct"], color="#2ca02c", linestyle="--", linewidth=1,
+               label=f"Peak {best['overall_pass_pct']:.1f}% @ {best['risk_pct']:.2f}%")
+    ax.set_title("Overall Pass Rate vs Risk per Trade")
+    ax.set_xlabel("Risk per trade (% of equity)")
+    ax.set_ylabel("Overall pass rate (%)")
+    ax.set_ylim(0, 100)
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+
+    # Right: failure-mode breakdown vs risk
+    ax = axes[1]
+    ax.plot(rp, sweep_df["fail_daily_loss_pct"], marker="o", color=_OUTCOME_COLORS["daily_loss"], label="Daily loss breach")
+    ax.plot(rp, sweep_df["fail_overall_loss_pct"], marker="o", color=_OUTCOME_COLORS["overall_loss"], label="Overall loss breach")
+    ax.plot(rp, sweep_df["fail_timeout_pct"], marker="o", color=_OUTCOME_COLORS["timeout"], label="Timed out")
+    ax.set_title("Failure Modes vs Risk per Trade")
+    ax.set_xlabel("Risk per trade (% of equity)")
+    ax.set_ylabel("% of trials")
+    ax.set_ylim(0, 100)
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+
+    fig.suptitle(
+        f"Risk Sensitivity  ({config.resample_mode}, {config.risk_sweep_simulations:,} sims/point)",
+        fontsize=14,
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig(output_path, dpi=120)
+    plt.close()
+
+
 def format_config_report(config: MonteCarloConfig) -> str:
     width = 60
     sizing_line = {
@@ -367,6 +534,12 @@ def format_config_report(config: MonteCarloConfig) -> str:
     ]
     if config.resample_mode == "bootstrap_trades":
         lines.append(f"{'Trades per day':28}{config.trades_per_day}")
+    if config.resample_mode == "bootstrap_blocks":
+        if config.block_size_range is not None:
+            block_line = f"{config.block_size_range[0]}-{config.block_size_range[1]} days (random per block)"
+        else:
+            block_line = f"{config.block_size_days} days (fixed)"
+        lines.append(f"{'Block size':28}{block_line}")
     lines += [
         f"{'Position sizing':28}{sizing_line}",
         f"{'Max trading days/phase':28}{config.max_trading_days_per_phase}",
@@ -548,11 +721,19 @@ def plot_dashboard(
 if __name__ == "__main__":
     # === CUSTOMIZE THESE SETTINGS BEFORE RUNNING ===
     config = MonteCarloConfig(
-        # Choose how to reshuffle trades: "bootstrap_trades" or "bootstrap_days"
-        resample_mode="bootstrap_days",
+        # Reshuffle mode: "bootstrap_trades", "bootstrap_days", or "bootstrap_blocks".
+        # "bootstrap_blocks" preserves cross-day streaks and is the least optimistic.
+        resample_mode="bootstrap_blocks",
 
         # If resample_mode="bootstrap_trades", how many trades per simulated day
         trades_per_day=2,
+
+        # Block resampling (only used when resample_mode="bootstrap_blocks"):
+        #   block_size_days   -> fixed run length in trading days
+        #   block_size_range  -> (min, max) to draw a random length per block; overrides
+        #                        block_size_days. Set to None to use the fixed size.
+        block_size_days=5,
+        block_size_range=None,  # e.g. (3, 15) for variable-length blocks
 
         # Position sizing: "pct_current_equity", "pct_initial_capital", or "fixed_usd"
         position_sizing_mode="pct_current_equity",
@@ -562,6 +743,11 @@ if __name__ == "__main__":
 
         # Number of simulations to run. Higher = more accurate but slower (10k to 50k typical)
         num_simulations=10_000,
+
+        # Risk-sweep pass-rate curve: sweep risk_pct and plot pass rate vs risk.
+        run_risk_sweep_enabled=True,
+        risk_sweep_values=(0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0),
+        risk_sweep_simulations=3_000,
 
         # Optional: change account_size, profit targets, loss limits, etc. here
         # account_size=100_000.0,
@@ -585,3 +771,17 @@ if __name__ == "__main__":
     dashboard_png = os.path.join(out_dir, "mc_dashboard.png")
     plot_dashboard(results_df, sample_curves, trade_pool_df, config, dashboard_png)
     print(f"Saved dashboard to {dashboard_png}")
+
+    if config.run_risk_sweep_enabled:
+        print("\nRunning risk-per-trade sweep...")
+        sweep_df = run_risk_sweep(config)
+        print()
+        print(format_risk_sweep_report(sweep_df))
+
+        sweep_csv = os.path.join(out_dir, "mc_risk_sweep.csv")
+        sweep_df.to_csv(sweep_csv, index=False)
+        print(f"\nSaved risk sweep to {sweep_csv}")
+
+        risk_curve_png = os.path.join(out_dir, "mc_risk_curve.png")
+        plot_risk_curve(sweep_df, config, risk_curve_png)
+        print(f"Saved risk curve to {risk_curve_png}")

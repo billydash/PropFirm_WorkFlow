@@ -27,7 +27,7 @@ class ORBConfig:
 
     csv_path: str = field(
         default_factory=lambda: os.path.join(
-            os.path.dirname(__file__), "..", "data", "SPY_1min.csv"
+            os.path.dirname(__file__), "..", "..", "data", "SPY_1min.csv"
         )
     )
     timezone: str = "America/New_York"
@@ -336,6 +336,20 @@ def compute_stats(trades_df: pd.DataFrame, config: ORBConfig) -> dict:
     gross_profit = wins["net_pnl"].sum()
     gross_loss = -losses["net_pnl"].sum()
 
+    # Sharpe/Sortino from daily returns (net P&L per trading day / starting equity),
+    # annualized with sqrt(252). Risk-free rate assumed 0.
+    daily_pnl = trades_df.groupby("date")["net_pnl"].sum()
+    daily_returns = daily_pnl / config.starting_equity
+    ann_factor = math.sqrt(252)
+
+    mean_daily = daily_returns.mean()
+    std_daily = daily_returns.std(ddof=1)
+    downside = daily_returns[daily_returns < 0]
+    downside_std = math.sqrt((downside**2).mean()) if not downside.empty else 0.0
+
+    sharpe = ann_factor * mean_daily / std_daily if std_daily > 0 else float("nan")
+    sortino = ann_factor * mean_daily / downside_std if downside_std > 0 else float("nan")
+
     stats = {
         "total_trades": len(trades_df),
         "wins": len(wins),
@@ -351,6 +365,8 @@ def compute_stats(trades_df: pd.DataFrame, config: ORBConfig) -> dict:
         "avg_mae_r": trades_df["mae_r"].mean(),
         "avg_mfe_r": trades_df["mfe_r"].mean(),
         "profit_factor": (gross_profit / gross_loss) if gross_loss > 0 else float("inf"),
+        "sharpe": sharpe,
+        "sortino": sortino,
         "total_costs": trades_df["costs"].sum(),
         "max_drawdown_usd": max_drawdown,
         "max_drawdown_pct": max_drawdown_pct,
@@ -422,6 +438,8 @@ def format_stats_report(stats: dict) -> str:
         f"{'Avg MAE':24}{stats['avg_mae_r']:.2f}R",
         f"{'Avg MFE':24}{stats['avg_mfe_r']:.2f}R",
         f"{'Profit factor':24}{stats['profit_factor']:.2f}",
+        f"{'Sharpe (annualized)':24}{stats['sharpe']:.2f}",
+        f"{'Sortino (annualized)':24}{stats['sortino']:.2f}",
         "",
         "-- Equity " + "-" * (width - 10),
         f"{'Starting equity':24}{usd('starting_equity')}",
@@ -445,8 +463,8 @@ def plot_equity_curve(equity: pd.Series, output_path: str) -> None:
 
 if __name__ == "__main__":
     config = ORBConfig(
-        start_date="2022-01-01",  # "YYYY-MM-DD", first date included in the backtest
-        end_date="2022-12-31",  # "YYYY-MM-DD", last date included in the backtest
+        start_date="2020-08-01",  # "YYYY-MM-DD", first date included in the backtest
+        end_date="2026-06-30",  # "YYYY-MM-DD", last date included in the backtest
 
         # Which breakout direction(s) to trade:
         #   "long"  - only take OR-high breakouts
