@@ -2,7 +2,7 @@
 
 Assumption: when a single bar's high/low touches both the stop and the target,
 we assume the stop is hit first (conservative tie-break — 1-min OHLC bars
-don't reveal intrabar order).
+don't reveal intrabar order). hi
 """
 
 import math
