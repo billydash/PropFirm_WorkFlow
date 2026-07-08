@@ -466,12 +466,45 @@ def format_stats_report(stats: dict) -> str:
     return "\n".join(lines)
 
 
-def plot_equity_curve(equity: pd.Series, output_path: str) -> None:
+def build_equity_curves(
+    trades_df: pd.DataFrame, trading_days_df: pd.DataFrame, config: ORBConfig
+) -> tuple:
+    """Build daily strategy-equity and buy-and-hold-equity series, both indexed by
+    every real trading day in [start_date, end_date] (from trading_days_df), so
+    no-trade days carry equity forward flat instead of being skipped."""
+    days = pd.DatetimeIndex(sorted(pd.to_datetime(trading_days_df["date"]).unique()))
+
+    daily_pnl = trades_df.groupby("date")["net_pnl"].sum() if not trades_df.empty else pd.Series(dtype=float)
+    daily_pnl.index = pd.to_datetime(daily_pnl.index)
+    daily_pnl = daily_pnl.reindex(days, fill_value=0.0)
+    strategy_equity = pd.Series(config.starting_equity + daily_pnl.cumsum().values, index=days)
+
+    price_df = load_data(config)
+    daily_close = price_df.groupby(price_df["timestamp"].dt.date)["close"].last()
+    daily_close.index = pd.to_datetime(daily_close.index)
+    daily_close = daily_close.reindex(days).ffill().bfill()
+    buy_hold_shares = config.starting_equity / daily_close.iloc[0]
+    buy_hold_equity = buy_hold_shares * daily_close
+
+    return strategy_equity, buy_hold_equity
+
+
+def plot_equity_curve(
+    strategy_equity: pd.Series, buy_hold_equity: pd.Series, output_path: str
+) -> None:
     plt.figure(figsize=(10, 5))
-    plt.plot(equity.values)
-    plt.title("ORB Strategy Equity Curve")
-    plt.xlabel("Trade #")
+    plt.plot(strategy_equity.index, strategy_equity.values, label="ORB Strategy")
+    plt.plot(
+        buy_hold_equity.index,
+        buy_hold_equity.values,
+        label="Buy & Hold (SPY)",
+        alpha=0.7,
+    )
+    plt.title("ORB Strategy Equity Curve vs. Buy & Hold")
+    plt.xlabel("Date")
     plt.ylabel("Equity ($)")
+    plt.legend()
+    plt.gcf().autofmt_xdate()
     plt.tight_layout()
     plt.savefig(output_path)
     plt.close()
@@ -549,6 +582,7 @@ if __name__ == "__main__":
         trades_df.to_csv(trades_csv, index=False)
         print(f"\nSaved trade log to {trades_csv}")
 
+        strategy_equity, buy_hold_equity = build_equity_curves(trades_df, trading_days_df, config)
         equity_png = os.path.join(out_dir, "orb_equity.png")
-        plot_equity_curve(equity, equity_png)
+        plot_equity_curve(strategy_equity, buy_hold_equity, equity_png)
         print(f"Saved equity curve to {equity_png}")
