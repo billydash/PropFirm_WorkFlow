@@ -219,4 +219,5 @@ __marimo__/
 
 # Data, backtester, and simulator output
 *.csv
+!Current/data/SPY_1min.csv
 *.png
