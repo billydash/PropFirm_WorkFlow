@@ -961,13 +961,13 @@ if __name__ == "__main__":
         # The funded account has no profit target, so it would run forever without a
         # cap. max_simulated_days is a right-censoring horizon, not a target: trials
         # still alive at this many trading days are reported as "survived".
-        max_simulated_days=100,      # 750 days ~3 trading years
+        max_simulated_days=750,      # 750 days ~3 trading years
         num_simulations=10_000,      # number of independent account lifetimes simulated
 
         # --- Payouts for the single main run (see also the sweep below) ---
         payouts_enabled=True,                  # master on/off switch for withdrawals in this run
-        payout_interval_trading_days=10,       # how often (in trading days) a payout event occurs; ~10 trading days approximates FTMO's real ~14 calendar-day cadence
-        payout_withdraw_pct=100.0,             # % of profit accrued SINCE THE LAST PAYOUT that gets withdrawn each cycle (0 = never withdraw, 100 = withdraw all accrued profit)
+        payout_interval_trading_days=20,       # how often (in trading days) a payout event occurs; ~10 trading days approximates FTMO's real ~14 calendar-day cadence
+        payout_withdraw_pct=75.0,             # % of profit accrued SINCE THE LAST PAYOUT that gets withdrawn each cycle (0 = never withdraw, 100 = withdraw all accrued profit)
         profit_split_pct=80.0,                 # % of each withdrawn dollar that is the TRADER'S take-home pay (the rest is FTMO's cut); affects only the money-made reporting, not equity/survival mechanics
 
         # --- Payout frequency x size sensitivity sweep ---

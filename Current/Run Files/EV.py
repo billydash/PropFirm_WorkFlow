@@ -159,11 +159,21 @@ def compute_ev_stats(challenge_stats: dict, funded_stats: dict, config: EVConfig
     Lifetime EV (retry with a fresh Challenge purchase after every failed attempt,
     until the Challenge is eventually passed) works out to:
       e_take_home - fee * (1 / p_pass - p_refund)
+
+    Alongside the true (mean-based) EV, this also reports a "typical outcome"
+    variant that substitutes the MEDIAN funded take-home for the mean. This is
+    NOT an expected value -- the median isn't additive across repeated attempts,
+    so it doesn't correspond to any real repeated-game payout -- it's a
+    risk/intuition sanity check for what a middle-of-the-distribution trader
+    actually walks away with, useful when the take-home distribution is
+    right-skewed (mean pulled up by a minority of trials with large compounded
+    payouts) and the mean alone overstates the "typical" experience.
     """
     fee = config.challenge_fee_usd
     p_pass = challenge_stats["pass_rate"]
     p_refund = funded_stats["refund_rate"] if config.fee_refunded_on_first_payout else 0.0
     e_take_home = funded_stats["avg_take_home_usd"]
+    median_take_home = funded_stats["median_take_home_usd"]
 
     ev_single_attempt = p_pass * e_take_home - fee * (1 - p_pass * p_refund)
     expected_attempts_to_pass = 1 / p_pass if p_pass > 0 else float("inf")
@@ -172,16 +182,26 @@ def compute_ev_stats(challenge_stats: dict, funded_stats: dict, config: EVConfig
         e_take_home - fee * (expected_attempts_to_pass - p_refund) if p_pass > 0 else -fee
     )
 
+    typical_single_attempt = p_pass * median_take_home - fee * (1 - p_pass * p_refund)
+    typical_lifetime_persist = (
+        median_take_home - fee * (expected_attempts_to_pass - p_refund)
+        if p_pass > 0
+        else -fee
+    )
+
     return {
         "challenge_fee_usd": fee,
         "p_pass": p_pass,
         "p_refund_given_funded": p_refund,
         "avg_take_home_given_funded": e_take_home,
+        "median_take_home_given_funded": median_take_home,
         "ev_single_attempt": ev_single_attempt,
         "roi_single_attempt_pct": 100 * ev_single_attempt / fee if fee else 0.0,
         "expected_attempts_to_pass": expected_attempts_to_pass,
         "expected_fees_paid_gross": expected_fees_gross,
         "ev_lifetime_persist": ev_lifetime_persist,
+        "typical_single_attempt": typical_single_attempt,
+        "typical_lifetime_persist": typical_lifetime_persist,
     }
 
 
@@ -240,6 +260,13 @@ def format_report(challenge_stats: dict, funded_stats: dict, ev_stats: dict) -> 
         f"{'Expected gross fees paid':30}${ev_stats['expected_fees_paid_gross']:,.2f}",
         f"{'EV, persist until passed':30}${ev_stats['ev_lifetime_persist']:,.2f}",
         "  buy a fresh Challenge after every failed attempt until you pass",
+        "",
+        "-- Typical Outcome (median-based, NOT an expected value) " + "-" * (width - 60),
+        f"{'Median take-home | funded':30}${ev_stats['median_take_home_given_funded']:,.2f}",
+        f"{'Typical, single attempt':30}${ev_stats['typical_single_attempt']:,.2f}",
+        f"{'Typical, persist until passed':30}${ev_stats['typical_lifetime_persist']:,.2f}",
+        "  substitutes median for mean funded phase take-home; not additive across repeat",
+        "  attempts, just a sanity check on the middle-of-distribution outcome",
         "=" * width,
     ]
     return "\n".join(lines)
