@@ -598,7 +598,7 @@ def format_config_report(config: MonteCarloConfig) -> str:
         f"{'Account size':28}${config.account_size:,.2f}",
         f"{'Phase 1 target':28}{config.profit_target_phase1_pct}%",
         f"{'Phase 2 target':28}{config.profit_target_phase2_pct}%",
-        f"{'Daily loss limit':28}{config.daily_loss_limit_pct}% of IC (static $, off prev close)",
+        f"{'Daily loss limit':28}{config.daily_loss_limit_pct}% (of day-start equity)",
         f"{'Max overall loss':28}{config.max_overall_loss_pct}% (static, of initial capital)",
         f"{'Min trading days/phase':28}{config.min_trading_days_per_phase}",
         f"{'Resample mode':28}{config.resample_mode}",
