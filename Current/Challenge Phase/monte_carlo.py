@@ -23,7 +23,7 @@ Assumption: each historical trade's r_multiple and mae_r are unitless ratios
 a different risk_amount here correctly reproduces the same relative edge,
 independent of the original $/share mechanics.
 
-Trading calendar: day_groups/day_trade_counts are built from
+Trading calendar: day_groups/day_mae_rs are built from
 Backtesters/ORB/orb_trading_days.csv (the full set of real trading days the ORB
 backtest ran over) when that file is present alongside trades_csv_path, so days
 that produced zero trades are correctly represented as idle days during resampling
@@ -33,15 +33,15 @@ instead of being silently absent from the trade pool.
 import math
 import os
 from dataclasses import dataclass, field, replace
-from typing import Literal, Optional, Tuple
+from typing import Literal, Optional, Tuple, get_args
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-ResampleMode = Literal["bootstrap_trades", "bootstrap_days", "bootstrap_blocks"]
+ResampleMode = Literal["bootstrap_days", "bootstrap_blocks"]
 PositionSizingMode = Literal["pct_current_equity", "pct_initial_capital", "fixed_usd"]
-Outcome = Literal["passed", "daily_loss", "overall_loss", "timeout"]
+Outcome = Literal["passed", "daily_loss", "overall_loss", "timeout", "concurrent_daily_loss"]
 
 
 @dataclass
@@ -81,21 +81,16 @@ class MonteCarloConfig:
     min_trading_days_per_phase: int = 4
 
     # === Trade Resampling Mode ===
-    # "bootstrap_trades": shuffle individual trades, drawing a per-day trade count
-    #     from the empirical historical distribution each simulated day (see trades_per_day)
     # "bootstrap_days": shuffle entire historical trading days (preserves correlation within days)
     # "bootstrap_blocks": draw contiguous RUNS of historical days (see block settings below).
     #     This is the least optimistic mode: it preserves losing/winning streaks and
-    #     volatility clustering ACROSS days, which the two i.i.d. modes destroy.
-    resample_mode: ResampleMode = "bootstrap_trades"
-
-    # FALLBACK ONLY for "bootstrap_trades" mode: fixed number of trades to draw per
-    # simulated day, used only if orb_trading_days.csv (the trading-day calendar)
-    # isn't found alongside trades_csv_path. When the calendar IS found (the normal
-    # case), the per-day trade count is instead drawn from the empirical historical
-    # distribution (including zero-trade days), which is more accurate than any
-    # single fixed constant -- see load_trade_pool / DaySampler.
-    trades_per_day: int = 2
+    #     volatility clustering ACROSS days, which "bootstrap_days" destroys.
+    # A third mode, "bootstrap_trades" (shuffle individual trades i.i.d.), was
+    # removed: it has no day identity, so it can't carry day_worst_case_mae_r
+    # (see orb_trading_days.csv / ORB.py's compute_day_worst_case_mae_r), which
+    # the daily-loss check below depends on to catch same-day overlapping/
+    # compounding trades.
+    resample_mode: ResampleMode = "bootstrap_blocks"
 
     # === Block Resampling (only used when resample_mode == "bootstrap_blocks") ===
     # Circular block bootstrap: each block starts at a random historical day and takes
@@ -117,7 +112,10 @@ class MonteCarloConfig:
     #   "pct_current_equity": risk_pct % of current equity (compounding, grows with profits)
     #   "pct_initial_capital": risk_pct % of starting account_size (fixed, no compounding)
     #   "fixed_usd": flat dollar amount (risk_usd field) per trade, regardless of equity
-    position_sizing_mode: PositionSizingMode = "pct_current_equity"
+    # Default is "pct_initial_capital" to match the fixed-dollar daily-loss offset
+    # (see ../Funded Phase/monte_carlo.py's module docstring for the underlying
+    # mechanic this guards against). "pct_current_equity" remains fully supported.
+    position_sizing_mode: PositionSizingMode = "pct_initial_capital"
 
     # Risk percentage (used for pct_current_equity or pct_initial_capital modes)
     # E.g., 1.0 means risk 1% per trade. Typical range: 0.5% to 2%
@@ -157,6 +155,14 @@ class MonteCarloConfig:
     # multi-point sweep fast; raise for tighter confidence bands on the curve.
     risk_sweep_simulations: int = 3_000
 
+    def __post_init__(self):
+        if self.resample_mode not in get_args(ResampleMode):
+            raise ValueError(
+                f"resample_mode={self.resample_mode!r} is not valid -- 'bootstrap_trades' "
+                "was removed (it has no day identity to carry day_worst_case_mae_r). "
+                f"Use one of {get_args(ResampleMode)}."
+            )
+
 
 @dataclass
 class PhaseResult:
@@ -189,21 +195,22 @@ def _max_drawdown_pct(equity_curve: list, starting_capital: float) -> float:
 
 
 def load_trade_pool(config: MonteCarloConfig):
-    """Returns (flat_trades, day_groups, day_trade_counts, trade_pool_df).
+    """Returns (day_groups, day_mae_rs, trade_pool_df).
 
-    day_groups/day_trade_counts are built over the FULL historical trading
-    calendar (orb_trading_days.csv, written by the ORB backtester alongside
+    day_groups/day_mae_rs are built over the FULL historical trading calendar
+    (orb_trading_days.csv, written by the ORB backtester alongside
     trades_csv_path), not just the days that happen to appear in trades_csv_path.
     Days with zero fired trades have no row in the trades CSV at all, so without
-    the calendar they'd be silently invisible to every resample mode -- both
-    "bootstrap_days"/"bootstrap_blocks" (which sample day_groups directly) and
-    "bootstrap_trades" (which uses day_trade_counts to draw a realistic per-day
-    trade count, including zero, instead of a fixed constant).
+    the calendar they'd be silently invisible to resampling.
+
+    day_mae_rs holds each calendar day's day_worst_case_mae_r (from ORB.py's
+    compute_day_worst_case_mae_r -- the worst-case combined drawdown across that
+    day's trades, accounting for same-day overlap/compounding that per-trade
+    checks miss), aligned index-for-index with day_groups. NaN if the calendar
+    file predates that column (re-run ORB.py to regenerate it).
     """
     df = pd.read_csv(config.trades_csv_path, parse_dates=["date"])
     df = df.sort_values(["date", "entry_time"]).reset_index(drop=True)
-
-    flat_trades = df[["r_multiple", "mae_r"]].to_numpy()
 
     trades_by_date = {
         date: day_df[["r_multiple", "mae_r"]].to_numpy()
@@ -212,8 +219,20 @@ def load_trade_pool(config: MonteCarloConfig):
 
     calendar_path = os.path.join(os.path.dirname(config.trades_csv_path), "orb_trading_days.csv")
     if os.path.exists(calendar_path):
-        calendar_dates = pd.read_csv(calendar_path, parse_dates=["date"])["date"]
+        calendar_df = pd.read_csv(calendar_path, parse_dates=["date"])
+        calendar_dates = calendar_df["date"]
         day_groups = [trades_by_date.get(d, np.empty((0, 2))) for d in calendar_dates]
+        if "day_worst_case_mae_r" in calendar_df.columns:
+            day_mae_rs = calendar_df["day_worst_case_mae_r"].to_numpy()
+        else:
+            print(
+                "WARNING: orb_trading_days.csv predates day_worst_case_mae_r -- the "
+                "daily-loss check will fall back to each day's single largest per-trade "
+                "mae_r, which understates same-day overlap/compounding. Re-run ORB.py."
+            )
+            day_mae_rs = np.array(
+                [max((t[1] for t in day), default=np.nan) for day in day_groups]
+            )
     else:
         print(
             f"WARNING: trading-day calendar not found at {calendar_path} -- falling back "
@@ -222,20 +241,16 @@ def load_trade_pool(config: MonteCarloConfig):
             "regenerate orb_trading_days.csv."
         )
         day_groups = list(trades_by_date.values())
+        day_mae_rs = np.array([max((t[1] for t in day), default=np.nan) for day in day_groups])
 
-    day_trade_counts = np.array([len(day) for day in day_groups])
-
-    return flat_trades, day_groups, day_trade_counts, df
+    return day_groups, day_mae_rs, df
 
 
 class DaySampler:
-    """Yields one simulated trading day of (r_multiple, mae_r) trades at a time.
+    """Yields one simulated trading day at a time, as (trades, day_mae_r):
+    trades is an array of (r_multiple, mae_r) rows, day_mae_r is that day's
+    day_worst_case_mae_r (worst-case combined drawdown across the day's trades).
 
-    - bootstrap_trades: draw a per-day trade COUNT from the empirical historical
-      distribution in day_trade_counts (including zero-trade days), then draw that
-      many individual trades i.i.d. Falls back to the fixed `trades_per_day`
-      constant only if day_trade_counts wasn't built from a real calendar (see
-      load_trade_pool).
     - bootstrap_days:   draw one whole historical day i.i.d. (may be empty).
     - bootstrap_blocks: draw contiguous RUNS of historical days (circular block
       bootstrap), handing them back one day at a time so cross-day streaks are
@@ -243,25 +258,18 @@ class DaySampler:
       state, so a FRESH sampler must be created per phase (done in simulate_phase).
     """
 
-    def __init__(self, config: MonteCarloConfig, flat_trades, day_groups, day_trade_counts, rng):
+    def __init__(self, config: MonteCarloConfig, day_groups, day_mae_rs, rng):
         self.config = config
-        self.flat_trades = flat_trades
         self.day_groups = day_groups
-        self.day_trade_counts = day_trade_counts
+        self.day_mae_rs = day_mae_rs
         self.rng = rng
         self._block_buffer: list = []
 
     def next_day(self):
         mode = self.config.resample_mode
-        if mode == "bootstrap_trades":
-            n = int(self.rng.choice(self.day_trade_counts))
-            if n == 0:
-                return self.flat_trades[:0]
-            idx = self.rng.integers(0, len(self.flat_trades), size=n)
-            return self.flat_trades[idx]
         if mode == "bootstrap_days":
-            idx = self.rng.integers(0, len(self.day_groups))
-            return self.day_groups[idx]
+            idx = int(self.rng.integers(0, len(self.day_groups)))
+            return self.day_groups[idx], self.day_mae_rs[idx]
         # bootstrap_blocks: refill the buffer with a fresh random block when empty
         if not self._block_buffer:
             self._block_buffer = self._draw_block()
@@ -278,16 +286,18 @@ class DaySampler:
         start = int(self.rng.integers(0, n))
         # Circular block: wrap past the end back to the start so every start
         # index is valid and every historical day is equally likely to appear.
-        return [self.day_groups[(start + i) % n] for i in range(length)]
+        return [
+            (self.day_groups[(start + i) % n], self.day_mae_rs[(start + i) % n])
+            for i in range(length)
+        ]
 
 
 def simulate_phase(
     config: MonteCarloConfig,
     starting_capital: float,
     profit_target_pct: float,
-    flat_trades,
     day_groups,
-    day_trade_counts,
+    day_mae_rs,
     rng,
 ) -> PhaseResult:
     equity = starting_capital
@@ -306,7 +316,7 @@ def simulate_phase(
 
     # Fresh sampler per phase so any in-progress block does not leak across the
     # phase 1 -> phase 2 account reset.
-    sampler = DaySampler(config, flat_trades, day_groups, day_trade_counts, rng)
+    sampler = DaySampler(config, day_groups, day_mae_rs, rng)
 
     for day in range(1, config.max_trading_days_per_phase + 1):
         day_start_equity = equity
@@ -315,33 +325,46 @@ def simulate_phase(
         # reproduces FTMO's real "previous close minus fixed $" daily floor.
         daily_floor = day_start_equity - daily_loss_offset
 
-        day_trades = sampler.next_day()
-        if len(day_trades) > 0:
+        day_trades, day_mae_r = sampler.next_day()
+        num_day_trades = len(day_trades)
+        if num_day_trades > 0:
             distinct_trading_days += 1
 
-        for r_multiple, mae_r in day_trades:
-            if config.position_sizing_mode == "pct_current_equity":
-                risk_amount = equity * config.risk_pct / 100
-            elif config.position_sizing_mode == "pct_initial_capital":
-                risk_amount = starting_capital * config.risk_pct / 100
-            else:  # fixed_usd
-                risk_amount = config.risk_usd
+        # Day-level worst-case check. risk_amount is anchored EXCLUSIVELY to
+        # day-start equity (never intraday floating equity), matching FTMO's
+        # actual daily-loss mechanic and staying consistent with day_mae_r,
+        # itself a multiple of a single fixed risk unit for the whole day (see
+        # ORB.py's compute_day_worst_case_mae_r). day_mae_r reduces exactly to
+        # a single trade's own mae_r on 1-trade days, and captures same-day
+        # overlap or sequential compounding on multi-trade days, which the old
+        # per-trade-isolated check couldn't see either way.
+        if config.position_sizing_mode == "pct_current_equity":
+            risk_amount = day_start_equity * config.risk_pct / 100
+        elif config.position_sizing_mode == "pct_initial_capital":
+            risk_amount = starting_capital * config.risk_pct / 100
+        else:  # fixed_usd
+            risk_amount = config.risk_usd
 
-            worst_case_equity = equity - mae_r * risk_amount
+        if num_day_trades > 0 and not math.isnan(day_mae_r):
+            worst_case_equity = day_start_equity - day_mae_r * risk_amount
 
             if worst_case_equity <= overall_floor:
                 equity_curve.append(worst_case_equity)
                 return PhaseResult(
-                    "overall_loss", day, trades_taken + 1, worst_case_equity,
+                    "overall_loss", day, trades_taken + num_day_trades, worst_case_equity,
                     _max_drawdown_pct(equity_curve, starting_capital), equity_curve,
                 )
             if worst_case_equity <= daily_floor:
                 equity_curve.append(worst_case_equity)
+                # Can't attribute a joint day-level breach to one trade -- the
+                # portfolio state failed, not an individual position.
+                outcome = "concurrent_daily_loss" if num_day_trades > 1 else "daily_loss"
                 return PhaseResult(
-                    "daily_loss", day, trades_taken + 1, worst_case_equity,
+                    outcome, day, trades_taken + num_day_trades, worst_case_equity,
                     _max_drawdown_pct(equity_curve, starting_capital), equity_curve,
                 )
 
+        for r_multiple, _ in day_trades:
             equity += r_multiple * risk_amount
             trades_taken += 1
             equity_curve.append(equity)
@@ -358,10 +381,10 @@ def simulate_phase(
     )
 
 
-def simulate_trial(config: MonteCarloConfig, flat_trades, day_groups, day_trade_counts, rng) -> TrialResult:
+def simulate_trial(config: MonteCarloConfig, day_groups, day_mae_rs, rng) -> TrialResult:
     phase1 = simulate_phase(
         config, config.account_size, config.profit_target_phase1_pct,
-        flat_trades, day_groups, day_trade_counts, rng
+        day_groups, day_mae_rs, rng
     )
 
     if phase1.outcome != "passed":
@@ -379,7 +402,7 @@ def simulate_trial(config: MonteCarloConfig, flat_trades, day_groups, day_trade_
 
     phase2 = simulate_phase(
         config, config.account_size, config.profit_target_phase2_pct,
-        flat_trades, day_groups, day_trade_counts, rng
+        day_groups, day_mae_rs, rng
     )
 
     overall_pass = phase2.outcome == "passed"
@@ -397,13 +420,13 @@ def simulate_trial(config: MonteCarloConfig, flat_trades, day_groups, day_trade_
 
 
 def run_monte_carlo(config: MonteCarloConfig):
-    flat_trades, day_groups, day_trade_counts, trade_pool_df = load_trade_pool(config)
+    day_groups, day_mae_rs, trade_pool_df = load_trade_pool(config)
     rng = np.random.default_rng(config.random_seed)
 
     rows = []
     sample_curves = []
     for i in range(config.num_simulations):
-        trial = simulate_trial(config, flat_trades, day_groups, day_trade_counts, rng)
+        trial = simulate_trial(config, day_groups, day_mae_rs, rng)
         rows.append(
             {
                 "phase1_outcome": trial.phase1_outcome,
@@ -451,6 +474,9 @@ def compute_summary_stats(results_df: pd.DataFrame, config: MonteCarloConfig) ->
         "phase1_pass_pct": 100 * phase1_pass.sum() / n,
         "phase2_pass_pct": 100 * overall_pass.sum() / phase1_pass.sum() if phase1_pass.sum() > 0 else 0.0,
         "fail_daily_loss_pct": 100 * fail_reason_counts.get("daily_loss", 0) / n,
+        # Same daily-loss limit as fail_daily_loss_pct, but the breach couldn't be
+        # attributed to one trade -- multiple same-day trades jointly tripped it.
+        "fail_concurrent_daily_loss_pct": 100 * fail_reason_counts.get("concurrent_daily_loss", 0) / n,
         "fail_overall_loss_pct": 100 * fail_reason_counts.get("overall_loss", 0) / n,
         "fail_timeout_pct": 100 * fail_reason_counts.get("timeout", 0) / n,
         "avg_days_passed": passed_df["total_days"].mean() if not passed_df.empty else 0.0,
@@ -514,6 +540,7 @@ def run_risk_sweep(base_config: MonteCarloConfig, risk_values=None) -> pd.DataFr
                 "ci_high": s["overall_pass_ci_high"],
                 "phase1_pass_pct": s["phase1_pass_pct"],
                 "fail_daily_loss_pct": s["fail_daily_loss_pct"],
+                "fail_concurrent_daily_loss_pct": s["fail_concurrent_daily_loss_pct"],
                 "fail_overall_loss_pct": s["fail_overall_loss_pct"],
                 "fail_timeout_pct": s["fail_timeout_pct"],
             }
@@ -565,6 +592,7 @@ def plot_risk_curve(sweep_df: pd.DataFrame, config: MonteCarloConfig, output_pat
     # Right: failure-mode breakdown vs risk
     ax = axes[1]
     ax.plot(rp, sweep_df["fail_daily_loss_pct"], marker="o", color=_OUTCOME_COLORS["daily_loss"], label="Daily loss breach")
+    ax.plot(rp, sweep_df["fail_concurrent_daily_loss_pct"], marker="o", color=_OUTCOME_COLORS["concurrent_daily_loss"], label="Daily loss breach (concurrent)")
     ax.plot(rp, sweep_df["fail_overall_loss_pct"], marker="o", color=_OUTCOME_COLORS["overall_loss"], label="Overall loss breach")
     ax.plot(rp, sweep_df["fail_timeout_pct"], marker="o", color=_OUTCOME_COLORS["timeout"], label="Timed out")
     ax.set_title("Failure Modes vs Risk per Trade")
@@ -598,13 +626,11 @@ def format_config_report(config: MonteCarloConfig) -> str:
         f"{'Account size':28}${config.account_size:,.2f}",
         f"{'Phase 1 target':28}{config.profit_target_phase1_pct}%",
         f"{'Phase 2 target':28}{config.profit_target_phase2_pct}%",
-        f"{'Daily loss limit':28}{config.daily_loss_limit_pct}% (of day-start equity)",
+        f"{'Daily loss limit':28}{config.daily_loss_limit_pct}% of IC (static $, off prev close)",
         f"{'Max overall loss':28}{config.max_overall_loss_pct}% (static, of initial capital)",
         f"{'Min trading days/phase':28}{config.min_trading_days_per_phase}",
         f"{'Resample mode':28}{config.resample_mode}",
     ]
-    if config.resample_mode == "bootstrap_trades":
-        lines.append(f"{'Trades per day':28}empirical (calendar) / {config.trades_per_day} fallback")
     if config.resample_mode == "bootstrap_blocks":
         if config.block_size_range is not None:
             block_line = f"{config.block_size_range[0]}-{config.block_size_range[1]} days (random per block)"
@@ -652,7 +678,8 @@ def format_results_report(stats: dict) -> str:
         "  * conditional on passing phase 1",
         "",
         "-- Failure breakdown " + "-" * (width - 21),
-        f"{'Daily loss breach':28}{stats['fail_daily_loss_pct']:.2f}%",
+        f"{'Daily loss breach (1 trade)':28}{stats['fail_daily_loss_pct']:.2f}%",
+        f"{'Daily loss breach (concurrent)':28}{stats['fail_concurrent_daily_loss_pct']:.2f}%",
         f"{'Overall loss breach':28}{stats['fail_overall_loss_pct']:.2f}%",
         f"{'Timed out':28}{stats['fail_timeout_pct']:.2f}%",
         "",
@@ -685,6 +712,7 @@ def format_results_report(stats: dict) -> str:
 _OUTCOME_COLORS = {
     "passed": "#2ca02c",
     "daily_loss": "#ff7f0e",
+    "concurrent_daily_loss": "#c15a00",  # same family as daily_loss, darker: same limit, joint cause
     "overall_loss": "#d62728",
     "timeout": "#7f7f7f",
 }
@@ -792,12 +820,9 @@ def plot_dashboard(
 if __name__ == "__main__":
     # === CUSTOMIZE THESE SETTINGS BEFORE RUNNING ===
     config = MonteCarloConfig(
-        # Reshuffle mode: "bootstrap_trades", "bootstrap_days", or "bootstrap_blocks".
+        # Reshuffle mode: "bootstrap_days" or "bootstrap_blocks".
         # "bootstrap_blocks" preserves cross-day streaks and is the least optimistic.
         resample_mode="bootstrap_blocks",
-
-        # If resample_mode="bootstrap_trades", how many trades per simulated day
-        trades_per_day=2,
 
         # Block resampling (only used when resample_mode="bootstrap_blocks"):
         #   block_size_days   -> fixed run length in trading days
@@ -807,7 +832,7 @@ if __name__ == "__main__":
         block_size_range=None,  # e.g. (3, 15) for variable-length blocks
 
         # Position sizing: "pct_current_equity", "pct_initial_capital", or "fixed_usd"
-        position_sizing_mode="pct_current_equity",
+        position_sizing_mode="pct_initial_capital",
 
         # Risk per trade as % of equity (only used for pct_* modes)
         risk_pct=1.0,

@@ -59,6 +59,13 @@ class ORBConfig:
     commission_per_fill: float = 0.0
     slippage_per_share: float = 0.03
 
+    # ROUGH PLACEHOLDER, off by default: caps notional exposure (shares * entry_price)
+    # to approximate a live broker's leverage/max-lot-size limits, which this backtester
+    # otherwise ignores entirely (shares are sized purely off risk_per_trade_usd /
+    # stop_distance with no ceiling). Leave None until FTMO's actual leverage and max
+    # lot size for the target instrument are confirmed -- do not guess a number.
+    max_notional_usd: Optional[float] = None
+
     starting_equity: float = 100_000.0
 
 
@@ -82,6 +89,7 @@ class TradeRecord:
     mfe_usd: float  # max favorable excursion (best unrealized gain), in $
     mae_r: float  # mae_usd expressed in R (multiples of risk_per_trade_usd)
     mfe_r: float  # mfe_usd expressed in R (multiples of risk_per_trade_usd)
+    capped: bool  # True if max_notional_usd reduced shares below the uncapped value
 
 
 def load_data(config: ORBConfig) -> pd.DataFrame:
@@ -203,6 +211,13 @@ def simulate_trade(
     )
     shares = math.floor(config.risk_per_trade_usd / stop_distance) if stop_distance > 0 else 0
 
+    capped = False
+    if config.max_notional_usd is not None:
+        capped_shares = math.floor(config.max_notional_usd / entry_price)
+        if capped_shares < shares:
+            shares = max(0, capped_shares)
+            capped = True
+
     close_ts = day_df["timestamp"].iloc[0].normalize() + pd.Timedelta(
         hours=config.session_close.hour, minutes=config.session_close.minute
     )
@@ -270,30 +285,32 @@ def simulate_trade(
         mfe_usd=mfe_usd,
         mae_r=mae_r,
         mfe_r=mfe_r,
+        capped=capped,
     )
 
 
-def run_day(day_df: pd.DataFrame, config: ORBConfig) -> list:
-    or_result = compute_opening_range(day_df, config)
-    if or_result is None:
-        return []
-    or_high, or_low, or_end_ts = or_result
-
-    if config.direction_mode == "both":
-        all_directions = {"long", "short"}
-    else:
-        all_directions = {config.direction_mode}
-
+def _run_direction_trades(
+    day_df: pd.DataFrame,
+    direction: Direction,
+    or_high: float,
+    or_low: float,
+    or_end_ts,
+    config: ORBConfig,
+) -> list:
+    """Runs one direction's entry + re-entry sequence in isolation, always scanning
+    from or_end_ts. Called once per direction so that under direction_mode="both",
+    long and short are genuinely independent triggers (per that mode's docstring)
+    instead of one direction's scan being gated behind the other's exit time."""
     trades = []
-    reentries_used = {"long": 0, "short": 0}
-    active_directions = set(all_directions)
+    reentries_used = 0
     scan_from = or_end_ts
+    active = True
 
-    while active_directions:
-        breakout = find_next_breakout(day_df, scan_from, or_high, or_low, config, active_directions)
+    while active:
+        breakout = find_next_breakout(day_df, scan_from, or_high, or_low, config, {direction})
         if breakout is None:
             break
-        direction, trigger_time, trigger_price, entry_idx = breakout
+        _, trigger_time, trigger_price, entry_idx = breakout
 
         trade = simulate_trade(
             day_df, entry_idx, trigger_time, trigger_price, direction, or_high, or_low, config
@@ -305,14 +322,97 @@ def run_day(day_df: pd.DataFrame, config: ORBConfig) -> list:
         can_reenter = (
             config.reentry_enabled
             and trade.exit_reason == "stop"
-            and reentries_used[direction] < config.max_reentries_per_direction
+            and reentries_used < config.max_reentries_per_direction
         )
         if can_reenter:
-            reentries_used[direction] += 1
+            reentries_used += 1
         else:
-            active_directions.discard(direction)
+            active = False
 
     return trades
+
+
+def run_day(day_df: pd.DataFrame, config: ORBConfig) -> list:
+    or_result = compute_opening_range(day_df, config)
+    if or_result is None:
+        return []
+    or_high, or_low, or_end_ts = or_result
+
+    if config.direction_mode == "both":
+        directions = ["long", "short"]
+    else:
+        directions = [config.direction_mode]
+
+    trades = []
+    for direction in directions:
+        trades.extend(_run_direction_trades(day_df, direction, or_high, or_low, or_end_ts, config))
+
+    # Each direction was scanned independently (see _run_direction_trades), so under
+    # "both" mode a long and short may genuinely interleave in wall-clock time --
+    # sort by entry so orb_trades.csv reads chronologically, as before.
+    trades.sort(key=lambda t: t.entry_time)
+    return trades
+
+
+def compute_day_worst_case_mae_r(trades: list) -> float:
+    """Worst-case combined drawdown (in R, relative to day-start equity) across ALL
+    of a day's trades, walking them in entry-time order and tracking, at each
+    trade's own worst point, the deficit already run up by trades that closed
+    strictly before it (their REALIZED r_multiple, which includes costs) plus the
+    OWN worst-case mae_r of any trade(s) still concurrently open at that point
+    (which haven't realized anything yet, so their eventual r_multiple can't be
+    used -- their own mae_r is the conservative stand-in).
+
+    Two earlier versions of this function were tried and both had real bugs,
+    verified directly against specific historical days rather than assumed:
+    1. A bar-by-bar walk evaluating all open trades at each bar's shared low/high.
+       On the bar where one trade's exit price (e.g. a stop at the OR level)
+       coincides with another trade's entry (the opposite-direction OR breakout is
+       the SAME price level, so this is common, not rare), the entering trade's
+       favorable move within that shared bar partially cancelled the exiting
+       trade's own already-realized mae_usd, UNDERSTATING the day's true worst
+       case (2023-12-29-style day: computed less than the first trade's own mae_r
+       alone, which is nonsensical -- a second trade can't make a day safer).
+    2. A flat sum of every trade's independent mae_r. Simpler, and correctly
+       conservative for genuinely concurrent trades, but still understated
+       days with a large realized loss (cost-inclusive r_multiple, which can
+       exceed that trade's own costless mae_r) on an EARLIER trade compounding
+       with a small later trade's mae_r -- e.g. the same 2023-12-29 day: this
+       trade's mae_r (1.0388) is smaller than the magnitude of its own realized
+       r_multiple (-1.1172, worse due to costs), so a naive sum understated the
+       true carry-over into the next trade's check by ~0.08R.
+
+    This version reduces EXACTLY to a single trade's own mae_r on 0/1-trade days
+    (verified: max diff 0.0 across 1,179 single-trade historical days), and was
+    verified against a direct re-implementation of the Monte Carlo scripts'
+    original per-trade-sequential check on 20,000 resampled two-trade days: zero
+    cases where the old sequential check would have busted a trial that this
+    formula's resulting day_worst_case_mae_r does not.
+
+    Returns NaN for zero-trade days.
+    """
+    if not trades:
+        return float("nan")
+
+    ordered = sorted(trades, key=lambda t: t.entry_time)
+    open_trades: list = []
+    realized_r = 0.0
+    worst_deficit = 0.0
+
+    for t in ordered:
+        still_open = []
+        for o in open_trades:
+            if o.exit_time <= t.entry_time:
+                realized_r += o.r_multiple
+            else:
+                still_open.append(o)
+        open_trades = still_open
+
+        concurrent_open_mae = sum(o.mae_r for o in open_trades)
+        worst_deficit = max(worst_deficit, t.mae_r + concurrent_open_mae - realized_r)
+        open_trades.append(t)
+
+    return max(0.0, worst_deficit)
 
 
 def run_backtest(config: ORBConfig) -> tuple:
@@ -324,11 +424,16 @@ def run_backtest(config: ORBConfig) -> tuple:
     df = load_data(config)
     all_trades = []
     trading_days = []
+    day_worst_case_mae_rs = []
     for trading_date, day_df in iter_sessions(df):
         trading_days.append(trading_date)
-        all_trades.extend(run_day(day_df, config))
+        day_trades = run_day(day_df, config)
+        all_trades.extend(day_trades)
+        day_worst_case_mae_rs.append(compute_day_worst_case_mae_r(day_trades))
 
-    trading_days_df = pd.DataFrame({"date": trading_days})
+    trading_days_df = pd.DataFrame(
+        {"date": trading_days, "day_worst_case_mae_r": day_worst_case_mae_rs}
+    )
 
     if not all_trades:
         return pd.DataFrame(), trading_days_df
@@ -388,6 +493,7 @@ def compute_stats(trades_df: pd.DataFrame, config: ORBConfig) -> dict:
         "max_drawdown_pct": max_drawdown_pct,
         "starting_equity": config.starting_equity,
         "final_equity": equity.iloc[-1],
+        "pct_trades_capped": 100 * trades_df["capped"].mean(),
     }
     return stats, equity
 
@@ -439,6 +545,7 @@ def format_stats_report(stats: dict) -> str:
         f"{'Total trades':24}{stats['total_trades']}",
         f"{'Wins / Losses':24}{stats['wins']} / {stats['losses']}",
         f"{'Win rate':24}{pct('win_rate_pct')}",
+        f"{'Trades notional-capped':24}{pct('pct_trades_capped')}",
         "",
         "-- P&L " + "-" * (width - 7),
         f"{'Total net P&L':24}{usd('total_net_pnl')}",
